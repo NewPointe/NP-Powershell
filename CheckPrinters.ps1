@@ -1,4 +1,4 @@
-﻿
+
 # Printer Connection Timeout
 $TIMEOUT = 2000;
 
@@ -23,20 +23,28 @@ Get the name of a printer.
 Some printers return invalid xml and this function fails. We can't really do anything about that.
 #>
 Function Get-PrinterSettingsXML([string] $printerIp, [int] $port = 9100) {
-    [xml](Send-PrinterCommand "^XA^HZS^XZ" $printerIp $port "</ZEBRA-ELTRON-PERSONALITY>");
+    $configString = Send-PrinterCommand "^XA^HZS^XZ" $printerIp $port -read "</ZEBRA-ELTRON-PERSONALITY>";
+    try {
+        [xml]$configString;
+    }
+    catch {
+        throw "Could not parse config XML from ${printerIp}:$port";
+    }
 }
 
 <#
 .SYNOPSIS
 Sends a command to a printer and reads it's response (if any).
 .DESCRIPTION
-The Send-PrinterCommand function sends a command to the printer and then attempts to read it's response.
+The Send-PrinterCommand function sends a command to the printer and (if specified) attempts to read it's response.
 .PARAMETER command
 The command to send.
 .PARAMETER printerIp
 The ip of the printer.
 .PARAMETER port
 The port to connect to (defaults to 9100).
+.PARAMETER read
+If present, attempt to read a response from the printer.
 .PARAMETER endText
 An optional string to listen for to indicate the end of a response.
 .EXAMPLE
@@ -45,7 +53,7 @@ Send-PrinterCommand "~HD" 0.0.0.0
 .NOTES
 Since some commands give different responses, or none at all, there's no guarentee that a command has (or hasn't) run successfuly.
 #>
-Function Send-PrinterCommand([string] $command, [string] $printerIp, [int] $port = 9100, [string] $endText = "") {
+Function Send-PrinterCommand([string] $command, [string] $printerIp, [int] $port = 9100, [switch] $read, [string] $endText = "") {
 
     # Create a new tcp client and connect the printer
     $client = New-Object System.Net.Sockets.TcpClient;
@@ -65,70 +73,76 @@ Function Send-PrinterCommand([string] $command, [string] $printerIp, [int] $port
     # Response string
     $response = "";
 
-    # Timeout counter
-    $timeoutCounter = 0;
+    if($read) {
 
-    # While the timeout's not expired
-    while ($timeoutCounter -lt $TIMEOUT) {
 
-        # Check if there's data available
-        if($stream.DataAvailable) {
+        # Timeout counter
+        $timeoutCounter = 0;
 
-            # We got some data so reset the timeout
-            $timeoutCounter = 0;
+        # While the timeout's not expired
+        while ($timeoutCounter -lt $TIMEOUT) {
 
-            # Create the Read Buffer
-            $buffer = New-Object System.Byte[] $READ_BUFFER_SIZE;
+            # Check if there's data available
+            if($stream.DataAvailable) {
 
-            # Fill the buffer
-            $readSize = $stream.Read($buffer, 0, $READ_BUFFER_SIZE);
+                # We got some data so reset the timeout
+                $timeoutCounter = 0;
 
-            # Calculate beginning/ending of string
-            $beginIndex = 0;
-            $endIndex = $readSize;
-            $foundEnd = $false;
-            for ($i = 0; $i -lt $readSize; $i++) {
-                $byte = $buffer[$i];
-                if($byte -eq $BYTE_START_OF_TEXT) {
-                    $beginIndex = $i + 1;
+                # Create the Read Buffer
+                $buffer = New-Object System.Byte[] $READ_BUFFER_SIZE;
+
+                # Fill the buffer
+                $readSize = $stream.Read($buffer, 0, $READ_BUFFER_SIZE);
+
+                # Calculate beginning/ending of string
+                $beginIndex = 0;
+                $endIndex = $readSize;
+                $foundEnd = $false;
+                for ($i = 0; $i -lt $readSize; $i++) {
+                    $byte = $buffer[$i];
+                    if($byte -eq $BYTE_START_OF_TEXT) {
+                        $beginIndex = $i + 1;
+                    }
+                    if($byte -eq $BYTE_END_OF_TEXT) {
+                        $foundEnd = $true;
+                        $endIndex = $i;
+                    }
                 }
-                if($byte -eq $BYTE_END_OF_TEXT) {
-                    $foundEnd = $true;
-                    $endIndex = $i;
-                }
-            }
 
-            # Decode Bytes and add to response
-            if($endIndex -gt $beginIndex) {
-                $response += $READ_ENCODING.GetString($buffer, $beginIndex, $endIndex - $beginIndex);
+                # Decode Bytes and add to response
+                if($endIndex -gt $beginIndex) {
+                    $response += $READ_ENCODING.GetString($buffer, $beginIndex, $endIndex - $beginIndex);
+                }
+                else {
+                    $response += $READ_ENCODING.GetString($buffer, 0, $readSize);
+                }
+
+                # Check for custom end text since some commands don't use an END-OF-TEXT character
+                if($endText -ne "" -and $response.Contains($endText)) { $foundEnd = $true; }
+
+                # If we got the end, stop reading
+                if($foundEnd) { break; }
             }
             else {
-                $response += $READ_ENCODING.GetString($buffer, 0, $readSize);
+
+                # Increment the timeout and wait a bit for more data
+                $timeoutCounter += 50;
+                start-sleep -Milliseconds 50;
             }
-
-            # Check for custom end text since some commands don't use an END-OF-TEXT character
-            if($endText -ne "" -and $response.Contains($endText)) { $foundEnd = $true; }
-
-            # If we got the end, stop reading
-            if($foundEnd) { break; }
         }
-        else {
 
-            # Increment the timeout and wait a bit for more data
-            $timeoutCounter += 50;
-            start-sleep -Milliseconds 50;
-        }
+        # If we timed out, throw an error
+        if( -Not $timeoutCounter -lt $TIMEOUT) { Throw "Read timed out for ${printerIp}:$port"; }
+
+        # Return (But not actually because PS)
+        $response
+
     }
-
-    # If we timed out, throw an error
-    if( -Not $timeoutCounter -lt $TIMEOUT) { Throw "Read timed out for ${printerIp}:$port"; }
 
     # Close everything
     $writer.Close()
     $stream.Close()
 
-    # Return
-    $response
 }
 
 # All of our check-in printers
@@ -169,6 +183,13 @@ $printers = @(
     # Wooster
     # -
 )
+
+# Set all printers to cut-off mode
+$i = 0
+foreach ($printer in $printers) {
+    Write-Progress -Activity "Setting cut mode" -Status "Setting $($printer.Ip)" -PercentComplete ($i++ / $printers.count * 100)
+    try { Send-PrinterCommand "^XA^MMC^JUS^XZ" $printer.Ip } catch { Write-Warning "$_" }
+}
 
 # Get the current config for each one
 $i = 0
